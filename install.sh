@@ -9,12 +9,13 @@ SYSTEM_ROOT="${HUBBOUND_SYSTEM_ROOT:-}"
 USER_BIN="${HUBBOUND_USER_BIN:-$HOME/.local/bin}"
 
 if [ -t 1 ] && [ -z "${NO_COLOR+x}" ]; then
-	cyan='\033[36m'
-	green='\033[32m'
-	yellow='\033[33m'
-	red='\033[31m'
-	bold='\033[1m'
-	reset='\033[0m'
+	escape=$(printf '\033')
+	cyan="${escape}[36m"
+	green="${escape}[32m"
+	yellow="${escape}[33m"
+	red="${escape}[31m"
+	bold="${escape}[1m"
+	reset="${escape}[0m"
 else
 	cyan=''
 	green=''
