@@ -186,18 +186,37 @@ try {
   Write-Ok "Installed Hubbound commands at $UserBin"
 
   $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+  if ($null -eq $UserPath) { $UserPath = "" }
   $PathAdded = ($UserPath -split ';') -notcontains $UserBin
   if ($PathAdded) {
     [Environment]::SetEnvironmentVariable("Path", ($UserPath.TrimEnd(';') + ";" + $UserBin), "User")
     Write-Ok "Added $UserBin to your user PATH"
   }
 
-  $Action = New-ScheduledTaskAction -Execute (Join-Path $Root "current\hubbound-agent.exe") -Argument "run"
-  $Trigger = New-ScheduledTaskTrigger -AtLogOn
-  $Principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive -RunLevel Limited
-  Register-ScheduledTask -TaskName "HubboundAgent" -Action $Action -Trigger $Trigger -Principal $Principal -Force | Out-Null
-  Start-ScheduledTask -TaskName "HubboundAgent" -ErrorAction SilentlyContinue
-  Write-Ok "Installed your Hubbound user agent"
+  # Prior elevated/partial installs may leave a HubboundAgent task owned by
+  # Administrators. Non-elevated Register-ScheduledTask -Force then returns
+  # "Acceso denegado" / Access denied. Remove-then-create as the console user.
+  $taskName = "HubboundAgent"
+  $agentExe = Join-Path $Root "current\hubbound-agent.exe"
+  $taskUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+  try {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    # schtasks reaches tasks the ScheduledTask module cannot see/remove when
+    # ownership differs across elevation boundaries.
+    & "$env:SystemRoot\System32\schtasks.exe" /Delete /TN $taskName /F 2>$null | Out-Null
+    $Action = New-ScheduledTaskAction -Execute $agentExe -Argument "run"
+    $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUser
+    $Principal = New-ScheduledTaskPrincipal -UserId $taskUser -LogonType Interactive -RunLevel Limited
+    Register-ScheduledTask -TaskName $taskName -Action $Action -Trigger $Trigger -Principal $Principal -Force | Out-Null
+    Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    Write-Ok "Installed your Hubbound user agent"
+  }
+  catch {
+    Write-Warn "Could not register scheduled task '$taskName': $($_.Exception.Message)"
+    Write-Warn "Daemon is installed. Register the agent manually or remove the old task as Administrator:"
+    Write-Warn "  schtasks /Delete /TN $taskName /F"
+    Write-Warn "  then re-run this installer (or: & '$agentExe' run)"
+  }
   Write-Ok "Daemon health check passed"
 
   Write-Host ""
