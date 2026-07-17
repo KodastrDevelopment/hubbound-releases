@@ -31,23 +31,24 @@ function Test-IsAdministrator {
 # Start-Process -ArgumentList array quoting is unreliable on Windows PowerShell
 # 5.1 (extra embedded quotes become literal characters in argv). Build one
 # properly escaped command line instead.
-function Get-HelperArgumentString {
-  param(
-    [string]$ArchivePath,
-    [string]$Version,
-    [string]$SystemRoot
-  )
-  $parts = @(
-    'system',
-    'install',
-    '--archive',
-    '"' + ($ArchivePath -replace '"', '""') + '"',
-    '--version',
-    '"' + ($Version -replace '"', '""') + '"',
-    '--system-root',
-    '"' + ($SystemRoot -replace '"', '""') + '"'
-  )
-  return ($parts -join ' ')
+function ConvertTo-SingleQuotedPsLiteral([string]$Value) {
+  return "'" + ($Value -replace "'", "''") + "'"
+}
+
+function Get-HelperFailureDetail([string]$LogPath, [int]$ExitCode) {
+  $detail = "System installation or daemon health check failed (exit code $ExitCode)"
+  if (-not (Test-Path -LiteralPath $LogPath)) {
+    return $detail
+  }
+  $raw = (Get-Content -LiteralPath $LogPath -Raw -ErrorAction SilentlyContinue)
+  if (-not $raw) {
+    return "$detail. See $LogPath"
+  }
+  $line = (($raw -split "`r?`n") | Where-Object { $_.Trim() -ne "" } | Select-Object -Last 1)
+  if ($line) {
+    return "$detail. Helper: $line (full log: $LogPath)"
+  }
+  return "$detail. See $LogPath"
 }
 
 function Invoke-SystemInstall {
@@ -55,33 +56,53 @@ function Invoke-SystemInstall {
     [string]$HelperPath,
     [string]$ArchivePath,
     [string]$Version,
-    [string]$SystemRoot
+    [string]$SystemRoot,
+    [string]$WorkDir
   )
+
+  # Persist outside the temp extract dir so failures survive cleanup.
+  $logPath = Join-Path $env:TEMP "hubbound-helper-install.log"
+  Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
 
   # Already elevated (common when the user opened "Run as administrator"):
   # call the helper in-process so stderr stays visible and no UAC flash occurs.
   # Start-Process -Verb RunAs from an elevated host is what caused the
   # "extra console opens and immediately closes" failure mode.
   if (Test-IsAdministrator) {
-    & $HelperPath system install --archive $ArchivePath --version $Version --system-root $SystemRoot
+    & $HelperPath system install --archive $ArchivePath --version $Version --system-root $SystemRoot 2>&1 |
+      Tee-Object -FilePath $logPath |
+      Out-Host
     if ($LASTEXITCODE -ne 0) {
-      throw "System installation or daemon health check failed (exit code $LASTEXITCODE)"
+      throw (Get-HelperFailureDetail -LogPath $logPath -ExitCode $LASTEXITCODE)
     }
     return
   }
 
   Write-Warn "Windows will request administrator permission once to install the system daemon."
 
-  # One elevation. Pass a single escaped argument string — array ArgumentList
-  # with embedded quotes is broken on Windows PowerShell 5.1 and made the
-  # helper receive literal quote characters in --archive/--system-root paths.
-  $argString = Get-HelperArgumentString -ArchivePath $ArchivePath -Version $Version -SystemRoot $SystemRoot
-  $process = Start-Process -FilePath $HelperPath -ArgumentList $argString -Verb RunAs -Wait -PassThru
+  # Elevate a tiny PowerShell runner instead of the helper EXE directly:
+  # 1) call-operator args are correct (no Start-Process ArgumentList quoting bugs)
+  # 2) helper stdout/stderr land in a log the parent can read after UAC
+  $runner = Join-Path $WorkDir "hubbound-elevate-install.ps1"
+  $helperLit = ConvertTo-SingleQuotedPsLiteral $HelperPath
+  $archiveLit = ConvertTo-SingleQuotedPsLiteral $ArchivePath
+  $versionLit = ConvertTo-SingleQuotedPsLiteral $Version
+  $rootLit = ConvertTo-SingleQuotedPsLiteral $SystemRoot
+  $logLit = ConvertTo-SingleQuotedPsLiteral $logPath
+  @(
+    '$ErrorActionPreference = "Continue"'
+    "& $helperLit system install --archive $archiveLit --version $versionLit --system-root $rootLit *> $logLit"
+    'exit $LASTEXITCODE'
+  ) | Set-Content -LiteralPath $runner -Encoding ASCII
+
+  $process = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+    -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $runner) `
+    -Verb RunAs -Wait -PassThru
   if ($null -eq $process) {
     throw "Administrator permission was not granted"
   }
   if ($process.ExitCode -ne 0) {
-    throw "System installation or daemon health check failed (exit code $($process.ExitCode))"
+    throw (Get-HelperFailureDetail -LogPath $logPath -ExitCode $process.ExitCode)
   }
 }
 
@@ -154,7 +175,7 @@ try {
   if (-not $Helper) { throw "Archive is missing hubbound-helper.exe" }
 
   $ArchivePath = Join-Path $Tmp $Archive
-  Invoke-SystemInstall -HelperPath $Helper -ArchivePath $ArchivePath -Version $Version -SystemRoot $Root
+  Invoke-SystemInstall -HelperPath $Helper -ArchivePath $ArchivePath -Version $Version -SystemRoot $Root -WorkDir $Tmp
   Write-Ok "Installed protected binaries and started hubboundd"
 
   Write-Step "Configuring your user session"
