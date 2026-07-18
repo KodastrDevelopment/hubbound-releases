@@ -194,27 +194,21 @@ try {
   }
 
   # Prior elevated/partial installs may leave a HubboundAgent task owned by
-  # Administrators. Non-elevated Register-ScheduledTask -Force then returns
-  # "Acceso denegado" / Access denied. Remove-then-create as the console user.
+  # Administrators. Remove it before recreating the task as the console user.
+  # Use schtasks for both operations: on some Windows installations the
+  # ScheduledTasks PowerShell cmdlets fail to register a valid SID-backed
+  # interactive task with the misleading "system cannot find the file
+  # specified" error.
   $taskName = "HubboundAgent"
   $agentExe = Join-Path $Root "current\hubbound-agent.exe"
-  # Use the SID, not .Name: for Microsoft-Account-linked local users, .Name
-  # returns "MicrosoftAccount\user@outlook.com", which Task Scheduler cannot
-  # always resolve back to a token. That failure surfaces as the misleading
-  # "system cannot find the file specified" on Register-ScheduledTask/
-  # New-ScheduledTaskTrigger -User, not as an account-resolution error. The
-  # SID needs no name resolution and always matches the current user.
-  $taskUserSid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
   try {
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-    # schtasks reaches tasks the ScheduledTask module cannot see/remove when
-    # ownership differs across elevation boundaries.
     & "$env:SystemRoot\System32\schtasks.exe" /Delete /TN $taskName /F 2>$null | Out-Null
-    $Action = New-ScheduledTaskAction -Execute $agentExe -Argument "run"
-    $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $taskUserSid
-    $Principal = New-ScheduledTaskPrincipal -UserId $taskUserSid -LogonType Interactive -RunLevel Limited
-    Register-ScheduledTask -TaskName $taskName -Action $Action -Trigger $Trigger -Principal $Principal -Force | Out-Null
-    Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    $taskCommand = '"{0}" run' -f $agentExe
+    $taskOutput = & "$env:SystemRoot\System32\schtasks.exe" /Create /TN $taskName /TR $taskCommand /SC ONLOGON /IT /RL LIMITED /F 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      throw ($taskOutput | Out-String).Trim()
+    }
+    & "$env:SystemRoot\System32\schtasks.exe" /Run /TN $taskName 2>$null | Out-Null
     Write-Ok "Installed your Hubbound user agent"
   }
   catch {
