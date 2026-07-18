@@ -157,16 +157,70 @@ function Start-HubboundAgentTask {
   $taskCommand = '"{0}" run' -f $AgentExe
   $taskOutput = & $schtasks /Create /TN $TaskName /TR $taskCommand /SC ONLOGON /IT /RL LIMITED /F 2>&1
   if ($LASTEXITCODE -ne 0) {
-    throw ($taskOutput | Out-String).Trim()
+    $taskExitCode = $LASTEXITCODE
+    $taskDetail = ($taskOutput | Out-String).Trim()
+    throw "schtasks /Create failed (exit $taskExitCode): $taskDetail"
   }
   & $schtasks /Query /TN $TaskName 2>$null | Out-Null
   if ($LASTEXITCODE -ne 0) {
+    & $schtasks /Delete /TN $TaskName /F 2>$null | Out-Null
     throw "Task Scheduler accepted '$TaskName' but it cannot be queried afterwards"
   }
   & $schtasks /Run /TN $TaskName 2>$null | Out-Null
   if ($LASTEXITCODE -ne 0) {
-    throw "Task '$TaskName' was created but could not be started"
+    # Registration already converged, so do not add the Run-key fallback and
+    # accidentally launch two agents at the next logon. This session can work
+    # without the updater agent; Task Scheduler will retry on the next logon.
+    Write-Warn "Task '$TaskName' was registered but could not be started in this session"
   }
+}
+
+function Remove-HubboundAgentRunKey {
+  $runKeyPath = "Software\Microsoft\Windows\CurrentVersion\Run"
+  $runKey = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($runKeyPath, $true)
+  if ($null -eq $runKey) { return }
+  try {
+    $runKey.DeleteValue("HubboundAgent", $false)
+  }
+  finally {
+    $runKey.Dispose()
+  }
+}
+
+function Start-HubboundAgentRunKey {
+  param([string]$AgentExe)
+
+  if (-not (Test-Path -LiteralPath $AgentExe)) {
+    throw "Hubbound agent executable is missing: $AgentExe"
+  }
+
+  # HKCU Run is the compatibility fallback when Task Scheduler registration is
+  # unavailable (for example because of local/domain policy or account lookup
+  # failures). It has the same user-logon scope, needs no password/admin token,
+  # and SetValue makes repeated installs idempotent. Keep the command pointed at
+  # `current` so the next logon follows an atomically activated suite update.
+  $runKeyPath = "Software\Microsoft\Windows\CurrentVersion\Run"
+  $command = '"{0}" run' -f $AgentExe
+  if ($command.Length -gt 260) {
+    throw "Hubbound agent startup command exceeds the Windows Run-key limit"
+  }
+  $runKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($runKeyPath)
+  if ($null -eq $runKey) {
+    throw "Could not open the current-user startup registry key"
+  }
+  try {
+    $runKey.SetValue("HubboundAgent", $command, [Microsoft.Win32.RegistryValueKind]::String)
+    if ($runKey.GetValue("HubboundAgent", "") -ne $command) {
+      throw "Windows did not persist the HubboundAgent startup command"
+    }
+  }
+  finally {
+    $runKey.Dispose()
+  }
+
+  # The Run key applies at the next logon; start this session now as the same
+  # unelevated user. -WindowStyle Hidden prevents a persistent console window.
+  Start-Process -FilePath $AgentExe -ArgumentList "run" -WindowStyle Hidden | Out-Null
 }
 
 if ($Preview) {
@@ -260,13 +314,23 @@ try {
   $agentExe = Join-Path $Root "current\hubbound-agent.exe"
   try {
     Start-HubboundAgentTask -TaskName $taskName -AgentExe $agentExe -WorkDir $Tmp
+    # A previous install may have needed the compatibility fallback. Never keep
+    # both registrations or Windows would launch two agents at the next logon.
+    Remove-HubboundAgentRunKey
     Write-Ok "Installed your Hubbound user agent"
   }
   catch {
     Write-Warn "Could not register scheduled task '$taskName': $($_.Exception.Message)"
-    Write-Warn "Daemon is installed. Register the agent manually or remove the old task as Administrator:"
-    Write-Warn "  schtasks /Delete /TN $taskName /F"
-    Write-Warn "  then re-run this installer (or: & '$agentExe' run)"
+    Write-Warn "Falling back to the current-user Windows startup registry."
+    try {
+      Start-HubboundAgentRunKey -AgentExe $agentExe
+      Write-Ok "Installed your Hubbound user agent via current-user startup"
+    }
+    catch {
+      Write-Warn "Could not register the fallback user agent: $($_.Exception.Message)"
+      Write-Warn "Daemon is installed. Start the agent manually with:"
+      Write-Warn "  & '$agentExe' run"
+    }
   }
 
   # hubboundd is a system service and cannot reliably resolve the desktop
