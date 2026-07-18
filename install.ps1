@@ -35,6 +35,23 @@ function ConvertTo-SingleQuotedPsLiteral([string]$Value) {
   return "'" + ($Value -replace "'", "''") + "'"
 }
 
+function Get-HubboundAgentStartupCommand([string]$AgentExe) {
+  # hubbound-agent is a long-running console-subsystem executable. Launching it
+  # directly from an interactive scheduled task creates a permanent console
+  # window at logon. Keep the user token that providers need, but host it in a
+  # hidden PowerShell process; agent diagnostics are already persisted to the
+  # normal Hubbound log file.
+  $powershellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+  $agentLit = ConvertTo-SingleQuotedPsLiteral $AgentExe
+  $command = ('"{0}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command "& {1} run"' -f $powershellExe, $agentLit)
+  # HKCU Run accepts at most 260 characters and schtasks /TR at most 262.
+  # Enforce the stricter bound before attempting either registration path.
+  if ($command.Length -gt 260) {
+    throw "Hubbound agent startup command exceeds the Windows startup command limit"
+  }
+  return $command
+}
+
 # Windows PowerShell 5.1 turns redirected native stderr (2>$null or 2>&1) into
 # error records. With the installer's ErrorActionPreference=Stop, the expected
 # "task not found" from best-effort cleanup can abort before /Create. Keep
@@ -71,7 +88,18 @@ function Get-HelperFailureDetail([string]$LogPath, [int]$ExitCode) {
   if (-not $raw) {
     return "$detail. See $LogPath"
   }
-  $line = (($raw -split "`r?`n") | Where-Object { $_.Trim() -ne "" } | Select-Object -Last 1)
+  # Windows PowerShell 5.1 appends ErrorRecord metadata after native stderr.
+  # The final line is commonly only "FullyQualifiedErrorId :
+  # NativeCommandError", which hid the helper's real filesystem/service error.
+  # hubbound-helper emits its authoritative error first; ignore the wrapper
+  # metadata and surface that diagnostic instead.
+  $line = (($raw -split "`r?`n") | Where-Object {
+    $value = $_.Trim()
+    $value -ne "" -and
+      $value -notmatch '^At .+\.ps1:\d+ char:\d+$' -and
+      $value -notmatch '^\+\s*(CategoryInfo|FullyQualifiedErrorId)\s*:' -and
+      $value -notmatch '^\+\s*[~&]'
+  } | Select-Object -First 1)
   if ($line) {
     return "$detail. Helper: $line (full log: $LogPath)"
   }
@@ -81,8 +109,13 @@ function Get-HelperFailureDetail([string]$LogPath, [int]$ExitCode) {
 function Invoke-InitialToolRepair {
   param(
     [string]$HubboundExe,
-    [string]$WorkDir
+    [string]$WorkDir,
+    [int]$TimeoutSeconds = 300
   )
+
+  if ($TimeoutSeconds -le 0) {
+    throw "Hubbound tool repair timeout must be greater than zero"
+  }
 
   # Windows PowerShell 5.1 turns native stderr redirected with 2>&1 into
   # ErrorRecord objects. With this installer's ErrorActionPreference=Stop, the
@@ -90,17 +123,45 @@ function Invoke-InitialToolRepair {
   # can install provider assets. Keep native stdout/stderr outside PowerShell's
   # streams so the child can finish, then inspect both its exit code and JSON.
   $stdoutPath = Join-Path $WorkDir "hubbound-doctor.stdout.json"
-  $stderrPath = Join-Path $WorkDir "hubbound-doctor.stderr.log"
+  # Persist the latest provider trace after WorkDir cleanup so a timeout still
+  # reveals which provider/subprocess failed to return.
+  $stderrPath = Join-Path $env:TEMP "hubbound-doctor-repair.log"
   Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
 
   $process = Start-Process -FilePath $HubboundExe `
     -ArgumentList @("doctor", "repair", "--output", "json") `
-    -NoNewWindow -Wait -PassThru `
+    -NoNewWindow -PassThru `
     -RedirectStandardOutput $stdoutPath `
     -RedirectStandardError $stderrPath
   if ($null -eq $process) {
     throw "Could not start Hubbound tool repair"
   }
+  if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+    # doctor may currently be waiting on git-ai or another provider child.
+    # Process.Kill() in Windows PowerShell 5.1 only terminates the direct
+    # process, so ask taskkill to close the full tree before using Kill as a
+    # portable fallback.
+    if ($env:OS -eq "Windows_NT") {
+      $taskkill = Join-Path $env:SystemRoot "System32\taskkill.exe"
+      $previousErrorActionPreference = $ErrorActionPreference
+      try {
+        $ErrorActionPreference = "Continue"
+        $null = @(& $taskkill /PID $process.Id /T /F 2>&1)
+      }
+      finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+      }
+    }
+    try { if (-not $process.HasExited) { $process.Kill() } } catch {}
+    try { $process.WaitForExit() } catch {}
+    $lastLog = (Get-Content -LiteralPath $stderrPath -ErrorAction SilentlyContinue | Where-Object { $_.Trim() -ne "" } | Select-Object -Last 1)
+    if ($lastLog) {
+      throw "Hubbound tool repair timed out after $TimeoutSeconds seconds. Last log: $lastLog (full log: $stderrPath)"
+    }
+    throw "Hubbound tool repair timed out after $TimeoutSeconds seconds (full log: $stderrPath)"
+  }
+  # Flush asynchronous redirected streams before reading the report files.
+  $process.WaitForExit()
 
   $stdout = Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue
   $stderr = Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue
@@ -243,7 +304,7 @@ function Start-HubboundAgentTask {
 
   # /IT makes this a user-session process; leaving /RU unspecified deliberately
   # binds it to the current user without ever asking for or persisting a password.
-  $taskCommand = '"{0}" run' -f $AgentExe
+  $taskCommand = Get-HubboundAgentStartupCommand $AgentExe
   $createResult = Invoke-SchtasksCommand -FilePath $schtasks -ArgumentList @(
     "/Create", "/TN", $TaskName, "/TR", $taskCommand,
     "/SC", "ONLOGON", "/IT", "/RL", "LIMITED", "/F", "/HResult"
@@ -293,10 +354,7 @@ function Start-HubboundAgentRunKey {
   # and SetValue makes repeated installs idempotent. Keep the command pointed at
   # `current` so the next logon follows an atomically activated suite update.
   $runKeyPath = "Software\Microsoft\Windows\CurrentVersion\Run"
-  $command = '"{0}" run' -f $AgentExe
-  if ($command.Length -gt 260) {
-    throw "Hubbound agent startup command exceeds the Windows Run-key limit"
-  }
+  $command = Get-HubboundAgentStartupCommand $AgentExe
   $runKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($runKeyPath)
   if ($null -eq $runKey) {
     throw "Could not open the current-user startup registry key"
@@ -430,6 +488,7 @@ try {
   # user's Windows profile. Run the first provider repair from this user
   # session so every eligible editor gets its hooks/scripts immediately.
   Write-Step "Repairing eligible tool integrations"
+  Write-Color "    First-time provider setup may take a few minutes (maximum 5 minutes)." DarkGray
   $hubboundExe = Join-Path $UserBin "hubbound.exe"
   try {
     $null = Invoke-InitialToolRepair -HubboundExe $hubboundExe -WorkDir $Tmp
