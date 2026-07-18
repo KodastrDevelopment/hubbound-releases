@@ -141,23 +141,17 @@ function Invoke-SystemInstall {
   $logPath = Join-Path $env:TEMP "hubbound-helper-install.log"
   Remove-Item -LiteralPath $logPath -Force -ErrorAction SilentlyContinue
 
-  # Already elevated (common when the user opened "Run as administrator"):
-  # call the helper in-process so stderr stays visible and no UAC flash occurs.
-  # Start-Process -Verb RunAs from an elevated host is what caused the
-  # "extra console opens and immediately closes" failure mode.
-  if (Test-IsAdministrator) {
-    & $HelperPath system install --archive $ArchivePath --version $Version --system-root $SystemRoot 2>&1 |
-      Tee-Object -FilePath $logPath |
-      Out-Host
-    if ($LASTEXITCODE -ne 0) {
-      throw (Get-HelperFailureDetail -LogPath $logPath -ExitCode $LASTEXITCODE)
-    }
-    return
+  $alreadyElevated = Test-IsAdministrator
+  if (-not $alreadyElevated) {
+    Write-Warn "Windows will request administrator permission once to install the system daemon."
   }
 
-  Write-Warn "Windows will request administrator permission once to install the system daemon."
-
-  # Elevate a tiny PowerShell runner instead of the helper EXE directly:
+  # Always isolate the native helper behind a tiny PowerShell runner, including
+  # when the caller already opened an Administrator console. Windows PowerShell
+  # 5.1 turns redirected native stderr into ErrorRecord objects; invoking the
+  # helper in the installer pipeline therefore made an expected first-install
+  # "service does not exist" cleanup message terminate the whole bootstrap.
+  # The runner keeps native streams in a file and reports only the exit code.
   # 1) call-operator args are correct (no Start-Process ArgumentList quoting bugs)
   # 2) helper stdout/stderr land in a log the parent can read after UAC
   $runner = Join-Path $WorkDir "hubbound-elevate-install.ps1"
@@ -172,9 +166,22 @@ function Invoke-SystemInstall {
     'exit $LASTEXITCODE'
   ) | Set-Content -LiteralPath $runner -Encoding ASCII
 
-  $process = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
-    -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $runner) `
-    -Verb RunAs -Wait -PassThru
+  $startProcessParameters = @{
+    FilePath = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+    ArgumentList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $runner)
+    Wait = $true
+    PassThru = $true
+  }
+  if ($alreadyElevated) {
+    # No second UAC process and no transient console window when the parent is
+    # already elevated. All useful diagnostics remain in $logPath.
+    $startProcessParameters["WindowStyle"] = "Hidden"
+  }
+  else {
+    $startProcessParameters["Verb"] = "RunAs"
+  }
+
+  $process = Start-Process @startProcessParameters
   if ($null -eq $process) {
     throw "Administrator permission was not granted"
   }
