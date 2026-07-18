@@ -35,6 +35,33 @@ function ConvertTo-SingleQuotedPsLiteral([string]$Value) {
   return "'" + ($Value -replace "'", "''") + "'"
 }
 
+# Windows PowerShell 5.1 turns redirected native stderr (2>$null or 2>&1) into
+# error records. With the installer's ErrorActionPreference=Stop, the expected
+# "task not found" from best-effort cleanup can abort before /Create. Keep
+# native diagnostics as data and request HRESULT exit codes where supported so
+# "file not found" and "access denied" do not both collapse into exit code 1.
+function Invoke-SchtasksCommand {
+  param([string]$FilePath, [string[]]$ArgumentList)
+
+  $previousErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = "Continue"
+    $rawOutput = @(& $FilePath @ArgumentList 2>&1)
+    $exitCode = [int]$LASTEXITCODE
+  }
+  finally {
+    $ErrorActionPreference = $previousErrorActionPreference
+  }
+
+  $unsignedExitCode = [BitConverter]::ToUInt32([BitConverter]::GetBytes($exitCode), 0)
+  $output = (($rawOutput | ForEach-Object { $_.ToString() }) -join [Environment]::NewLine).Trim()
+  return [pscustomobject]@{
+    ExitCode = $exitCode
+    ExitCodeHex = ("0x{0:X8}" -f $unsignedExitCode)
+    Output = $output
+  }
+}
+
 function Get-HelperFailureDetail([string]$LogPath, [int]$ExitCode) {
   $detail = "System installation or daemon health check failed (exit code $ExitCode)"
   if (-not (Test-Path -LiteralPath $LogPath)) {
@@ -49,6 +76,56 @@ function Get-HelperFailureDetail([string]$LogPath, [int]$ExitCode) {
     return "$detail. Helper: $line (full log: $LogPath)"
   }
   return "$detail. See $LogPath"
+}
+
+function Invoke-InitialToolRepair {
+  param(
+    [string]$HubboundExe,
+    [string]$WorkDir
+  )
+
+  # Windows PowerShell 5.1 turns native stderr redirected with 2>&1 into
+  # ErrorRecord objects. With this installer's ErrorActionPreference=Stop, the
+  # first slog line ("doctor started") terminates the pipeline before repair
+  # can install provider assets. Keep native stdout/stderr outside PowerShell's
+  # streams so the child can finish, then inspect both its exit code and JSON.
+  $stdoutPath = Join-Path $WorkDir "hubbound-doctor.stdout.json"
+  $stderrPath = Join-Path $WorkDir "hubbound-doctor.stderr.log"
+  Remove-Item -LiteralPath $stdoutPath, $stderrPath -Force -ErrorAction SilentlyContinue
+
+  $process = Start-Process -FilePath $HubboundExe `
+    -ArgumentList @("doctor", "repair", "--output", "json") `
+    -NoNewWindow -Wait -PassThru `
+    -RedirectStandardOutput $stdoutPath `
+    -RedirectStandardError $stderrPath
+  if ($null -eq $process) {
+    throw "Could not start Hubbound tool repair"
+  }
+
+  $stdout = Get-Content -LiteralPath $stdoutPath -Raw -ErrorAction SilentlyContinue
+  $stderr = Get-Content -LiteralPath $stderrPath -Raw -ErrorAction SilentlyContinue
+  if ($process.ExitCode -ne 0) {
+    $detail = if ($stderr) { $stderr.Trim() } elseif ($stdout) { $stdout.Trim() } else { "no diagnostic output" }
+    throw "Hubbound tool repair exited with code $($process.ExitCode): $detail"
+  }
+  if (-not $stdout) {
+    $detail = if ($stderr) { $stderr.Trim() } else { "no diagnostic output" }
+    throw "Hubbound tool repair returned no JSON report: $detail"
+  }
+
+  try {
+    $report = $stdout | ConvertFrom-Json
+  }
+  catch {
+    throw "Hubbound tool repair returned invalid JSON: $($_.Exception.Message)"
+  }
+
+  $issues = @($report.providers | Where-Object { $_.status -eq "failed" -or $_.status -eq "degraded" })
+  if ($issues.Count -gt 0) {
+    $detail = ($issues | ForEach-Object { "$($_.provider): $($_.reason)" }) -join "; "
+    throw "Hubbound tool repair did not converge: $detail"
+  }
+  return $report
 }
 
 function Invoke-SystemInstall {
@@ -110,14 +187,19 @@ function Remove-StaleHubboundAgentTask {
   param([string]$TaskName, [string]$WorkDir)
 
   $schtasks = Join-Path $env:SystemRoot "System32\schtasks.exe"
-  & $schtasks /End /TN $TaskName 2>$null | Out-Null
-  & $schtasks /Delete /TN $TaskName /F 2>$null | Out-Null
+  [void](Invoke-SchtasksCommand -FilePath $schtasks -ArgumentList @("/End", "/TN", $TaskName))
+  [void](Invoke-SchtasksCommand -FilePath $schtasks -ArgumentList @("/Delete", "/TN", $TaskName, "/F"))
 
   # A task from a previous elevated/partial installation may be owned by a
   # different SID. If it survived the user-scope delete, retry exactly this
-  # cleanup through UAC before creating the new user task.
-  & $schtasks /Query /TN $TaskName 2>$null | Out-Null
-  if ($LASTEXITCODE -ne 0) { return }
+  # cleanup through UAC before creating the new user task. Do not treat every
+  # nonzero result as "absent": access denied means the task may merely be
+  # hidden from the current unelevated token.
+  $queryResult = Invoke-SchtasksCommand -FilePath $schtasks -ArgumentList @("/Query", "/TN", $TaskName, "/HResult")
+  if ($queryResult.ExitCodeHex -eq "0x80070002") { return }
+  if ($queryResult.ExitCode -ne 0 -and $queryResult.ExitCodeHex -ne "0x80070005") {
+    throw "Could not inspect existing task '$TaskName' (exit $($queryResult.ExitCode), $($queryResult.ExitCodeHex)): $($queryResult.Output)"
+  }
 
   $runner = Join-Path $WorkDir "hubbound-elevate-agent-cleanup.ps1"
   $taskLit = ConvertTo-SingleQuotedPsLiteral $TaskName
@@ -155,23 +237,27 @@ function Start-HubboundAgentTask {
   # /IT makes this a user-session process; leaving /RU unspecified deliberately
   # binds it to the current user without ever asking for or persisting a password.
   $taskCommand = '"{0}" run' -f $AgentExe
-  $taskOutput = & $schtasks /Create /TN $TaskName /TR $taskCommand /SC ONLOGON /IT /RL LIMITED /F 2>&1
-  if ($LASTEXITCODE -ne 0) {
-    $taskExitCode = $LASTEXITCODE
-    $taskDetail = ($taskOutput | Out-String).Trim()
-    throw "schtasks /Create failed (exit $taskExitCode): $taskDetail"
+  $createResult = Invoke-SchtasksCommand -FilePath $schtasks -ArgumentList @(
+    "/Create", "/TN", $TaskName, "/TR", $taskCommand,
+    "/SC", "ONLOGON", "/IT", "/RL", "LIMITED", "/F", "/HResult"
+  )
+  if ($createResult.ExitCode -ne 0) {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $scheduleService = Get-Service -Name "Schedule" -ErrorAction SilentlyContinue
+    $scheduleStatus = if ($null -eq $scheduleService) { "not-found" } else { $scheduleService.Status.ToString() }
+    throw "schtasks /Create failed (exit $($createResult.ExitCode), $($createResult.ExitCodeHex)): $($createResult.Output); agent_exists=$((Test-Path -LiteralPath $AgentExe)); scheduler=$scheduleStatus; identity=$($identity.Name); sid=$($identity.User.Value)"
   }
-  & $schtasks /Query /TN $TaskName 2>$null | Out-Null
-  if ($LASTEXITCODE -ne 0) {
-    & $schtasks /Delete /TN $TaskName /F 2>$null | Out-Null
-    throw "Task Scheduler accepted '$TaskName' but it cannot be queried afterwards"
+  $queryResult = Invoke-SchtasksCommand -FilePath $schtasks -ArgumentList @("/Query", "/TN", $TaskName, "/HResult")
+  if ($queryResult.ExitCode -ne 0) {
+    [void](Invoke-SchtasksCommand -FilePath $schtasks -ArgumentList @("/Delete", "/TN", $TaskName, "/F"))
+    throw "Task Scheduler accepted '$TaskName' but query failed (exit $($queryResult.ExitCode), $($queryResult.ExitCodeHex)): $($queryResult.Output)"
   }
-  & $schtasks /Run /TN $TaskName 2>$null | Out-Null
-  if ($LASTEXITCODE -ne 0) {
+  $runResult = Invoke-SchtasksCommand -FilePath $schtasks -ArgumentList @("/Run", "/TN", $TaskName)
+  if ($runResult.ExitCode -ne 0) {
     # Registration already converged, so do not add the Run-key fallback and
     # accidentally launch two agents at the next logon. This session can work
     # without the updater agent; Task Scheduler will retry on the next logon.
-    Write-Warn "Task '$TaskName' was registered but could not be started in this session"
+    Write-Warn "Task '$TaskName' was registered but could not be started in this session (exit $($runResult.ExitCode), $($runResult.ExitCodeHex)): $($runResult.Output)"
   }
 }
 
@@ -339,10 +425,7 @@ try {
   Write-Step "Repairing eligible tool integrations"
   $hubboundExe = Join-Path $UserBin "hubbound.exe"
   try {
-    $repairOutput = & $hubboundExe doctor repair --output json 2>&1
-    if ($LASTEXITCODE -ne 0) {
-      throw ($repairOutput | Out-String).Trim()
-    }
+    $null = Invoke-InitialToolRepair -HubboundExe $hubboundExe -WorkDir $Tmp
     Write-Ok "Eligible tool integrations repaired"
   }
   catch {
