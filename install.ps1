@@ -106,6 +106,69 @@ function Invoke-SystemInstall {
   }
 }
 
+function Remove-StaleHubboundAgentTask {
+  param([string]$TaskName, [string]$WorkDir)
+
+  $schtasks = Join-Path $env:SystemRoot "System32\schtasks.exe"
+  & $schtasks /End /TN $TaskName 2>$null | Out-Null
+  & $schtasks /Delete /TN $TaskName /F 2>$null | Out-Null
+
+  # A task from a previous elevated/partial installation may be owned by a
+  # different SID. If it survived the user-scope delete, retry exactly this
+  # cleanup through UAC before creating the new user task.
+  & $schtasks /Query /TN $TaskName 2>$null | Out-Null
+  if ($LASTEXITCODE -ne 0) { return }
+
+  $runner = Join-Path $WorkDir "hubbound-elevate-agent-cleanup.ps1"
+  $taskLit = ConvertTo-SingleQuotedPsLiteral $TaskName
+  $schtasksLit = ConvertTo-SingleQuotedPsLiteral $schtasks
+  @(
+    '$ErrorActionPreference = "Continue"'
+    "`$taskName = $taskLit"
+    "`$schtasks = $schtasksLit"
+    '& $schtasks /End /TN $taskName 2>$null | Out-Null'
+    '& $schtasks /Delete /TN $taskName /F 2>$null | Out-Null'
+    '& $schtasks /Query /TN $taskName 2>$null | Out-Null'
+    'if ($LASTEXITCODE -eq 0) { exit 1 }'
+    'exit 0'
+  ) | Set-Content -LiteralPath $runner -Encoding ASCII
+
+  Write-Warn "Removing stale HubboundAgent task with administrator permission."
+  $process = Start-Process -FilePath "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+    -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $runner) `
+    -Verb RunAs -Wait -PassThru
+  if ($null -eq $process -or $process.ExitCode -ne 0) {
+    throw "Could not remove stale scheduled task '$TaskName'"
+  }
+}
+
+function Start-HubboundAgentTask {
+  param([string]$TaskName, [string]$AgentExe, [string]$WorkDir)
+
+  if (-not (Test-Path -LiteralPath $AgentExe)) {
+    throw "Hubbound agent executable is missing: $AgentExe"
+  }
+
+  $schtasks = Join-Path $env:SystemRoot "System32\schtasks.exe"
+  Remove-StaleHubboundAgentTask -TaskName $TaskName -WorkDir $WorkDir
+
+  # /IT makes this a user-session process; leaving /RU unspecified deliberately
+  # binds it to the current user without ever asking for or persisting a password.
+  $taskCommand = '"{0}" run' -f $AgentExe
+  $taskOutput = & $schtasks /Create /TN $TaskName /TR $taskCommand /SC ONLOGON /IT /RL LIMITED /F 2>&1
+  if ($LASTEXITCODE -ne 0) {
+    throw ($taskOutput | Out-String).Trim()
+  }
+  & $schtasks /Query /TN $TaskName 2>$null | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "Task Scheduler accepted '$TaskName' but it cannot be queried afterwards"
+  }
+  & $schtasks /Run /TN $TaskName 2>$null | Out-Null
+  if ($LASTEXITCODE -ne 0) {
+    throw "Task '$TaskName' was created but could not be started"
+  }
+}
+
 if ($Preview) {
   Write-Title "Hubbound Installer"
   Write-Host ""
@@ -193,22 +256,10 @@ try {
     Write-Ok "Added $UserBin to your user PATH"
   }
 
-  # Prior elevated/partial installs may leave a HubboundAgent task owned by
-  # Administrators. Remove it before recreating the task as the console user.
-  # Use schtasks for both operations: on some Windows installations the
-  # ScheduledTasks PowerShell cmdlets fail to register a valid SID-backed
-  # interactive task with the misleading "system cannot find the file
-  # specified" error.
   $taskName = "HubboundAgent"
   $agentExe = Join-Path $Root "current\hubbound-agent.exe"
   try {
-    & "$env:SystemRoot\System32\schtasks.exe" /Delete /TN $taskName /F 2>$null | Out-Null
-    $taskCommand = '"{0}" run' -f $agentExe
-    $taskOutput = & "$env:SystemRoot\System32\schtasks.exe" /Create /TN $taskName /TR $taskCommand /SC ONLOGON /IT /RL LIMITED /F 2>&1
-    if ($LASTEXITCODE -ne 0) {
-      throw ($taskOutput | Out-String).Trim()
-    }
-    & "$env:SystemRoot\System32\schtasks.exe" /Run /TN $taskName 2>$null | Out-Null
+    Start-HubboundAgentTask -TaskName $taskName -AgentExe $agentExe -WorkDir $Tmp
     Write-Ok "Installed your Hubbound user agent"
   }
   catch {
@@ -216,6 +267,23 @@ try {
     Write-Warn "Daemon is installed. Register the agent manually or remove the old task as Administrator:"
     Write-Warn "  schtasks /Delete /TN $taskName /F"
     Write-Warn "  then re-run this installer (or: & '$agentExe' run)"
+  }
+
+  # hubboundd is a system service and cannot reliably resolve the desktop
+  # user's Windows profile. Run the first provider repair from this user
+  # session so every eligible editor gets its hooks/scripts immediately.
+  Write-Step "Repairing eligible tool integrations"
+  $hubboundExe = Join-Path $UserBin "hubbound.exe"
+  try {
+    $repairOutput = & $hubboundExe doctor repair --output json 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      throw ($repairOutput | Out-String).Trim()
+    }
+    Write-Ok "Eligible tool integrations repaired"
+  }
+  catch {
+    Write-Warn "Initial tool repair was incomplete: $($_.Exception.Message)"
+    Write-Warn "Run 'hubbound doctor repair' after restarting any affected IDEs."
   }
   Write-Ok "Daemon health check passed"
 
