@@ -36,14 +36,13 @@ function ConvertTo-SingleQuotedPsLiteral([string]$Value) {
 }
 
 function Get-HubboundAgentStartupCommand([string]$AgentExe) {
-  # hubbound-agent is a long-running console-subsystem executable. Launching it
-  # directly from an interactive scheduled task creates a permanent console
-  # window at logon. Keep the user token that providers need, but host it in a
-  # hidden PowerShell process; agent diagnostics are already persisted to the
-  # normal Hubbound log file.
-  $powershellExe = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
-  $agentLit = ConvertTo-SingleQuotedPsLiteral $AgentExe
-  $command = ('"{0}" -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command "& {1} run"' -f $powershellExe, $agentLit)
+  # hubbound-agent is built with -H=windowsgui (see .goreleaser.yaml), so
+  # Windows never allocates a console for it no matter which terminal host
+  # (conhost/Windows Terminal) is active. That lets the scheduled task/Run-key
+  # launch the executable directly instead of routing through a hidden
+  # PowerShell wrapper, which Windows Terminal ignored -WindowStyle Hidden on
+  # anyway. Agent diagnostics are persisted to the normal Hubbound log file.
+  $command = '"{0}" run' -f $AgentExe
   # HKCU Run accepts at most 260 characters and schtasks /TR at most 262.
   # Enforce the stricter bound before attempting either registration path.
   if ($command.Length -gt 260) {
